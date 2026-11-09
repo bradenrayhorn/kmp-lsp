@@ -396,12 +396,15 @@ fn enrich_symbol<I: IndexRead>(
     let doc = if options.include_doc {
         let source_doc =
             extract_doc_comment(&data.lines, sym.selection_start() as usize).unwrap_or_default();
-        if source_doc.is_empty() {
-            // JAR/sidecar symbols carry raw doc text (HTML Javadoc for Java
-            // libraries) — render it the same way as source-extracted docs.
-            crate::indexer::doc::format_doc_comment(sym.doc())
-        } else {
+        if !source_doc.is_empty() {
             source_doc
+        } else if !sym.doc().is_empty() {
+            // JAR/sidecar symbols carry raw HTML Javadoc.
+            crate::indexer::doc::format_doc_comment(sym.doc())
+        } else if data.lines.is_empty() {
+            load_source_doc(&location.uri, sym.selection_start() as usize).unwrap_or_default()
+        } else {
+            String::new()
         }
     } else {
         String::new()
@@ -418,6 +421,22 @@ fn enrich_symbol<I: IndexRead>(
         container: sym.container.clone(),
         package: data.package.clone(),
     })
+}
+
+/// Library caches omit source lines and source-parsed symbols may have no stored
+/// doc. Read only through the selected declaration on an explicit hover/resolve;
+/// never reparse or retain dependency source in the index.
+fn load_source_doc(uri: &Url, declaration_line: usize) -> Option<String> {
+    use std::io::BufRead;
+
+    let path = uri.to_file_path().ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    let lines = std::io::BufReader::new(file)
+        .lines()
+        .take(declaration_line + 1)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    extract_doc_comment(&lines, declaration_line)
 }
 
 /// Rebuild a property signature with an inferred type annotation.

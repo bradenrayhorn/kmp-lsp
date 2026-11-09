@@ -8,6 +8,292 @@ fn hover_text(hover: &Hover) -> String {
     }
 }
 
+#[test]
+fn hover_resolves_constructor_and_bare_factory_receivers() {
+    let indexer = Indexer::new();
+    let uri = Url::parse("file:///example/Factory.kt").unwrap();
+    for receiver in ["Foo()", "create()"] {
+        let source = format!(
+            "package example\nclass Foo {{\n    /** Instance documentation. */\n    fun action(): String = \"value\"\n}}\nfun create(): Foo = Foo()\nfun example() = {receiver}.action()\n"
+        );
+        indexer.index_content(&uri, &source);
+        indexer.store_live_tree(&uri, &source);
+        let line = source.lines().last().unwrap();
+        let position = Position::new(6, line.find(".action").unwrap() as u32 + 1);
+        let context = CursorContext::build(&indexer, &uri, position).unwrap();
+        let hover = compute_hover(&indexer, &context, &uri, position)
+            .unwrap_or_else(|| panic!("missing hover for {receiver}"));
+        assert!(hover_text(&hover).contains("Instance documentation."));
+    }
+}
+
+#[test]
+fn hover_resolves_return_types_in_the_declaring_class_scope() {
+    let indexer = Indexer::new();
+    let java_uri = Url::parse("file:///example/Factories.java").unwrap();
+    indexer.index_content(
+        &java_uri,
+        r#"package example;
+class A {
+    static class Result {
+        /** The correct result. */
+        public String action() { return null; }
+    }
+    public static Result make() { return null; }
+}
+class B {
+    static class Result {
+        /** The wrong result. */
+        public String action() { return null; }
+    }
+}
+"#,
+    );
+    let uri = Url::parse("file:///example/Example.kt").unwrap();
+    let source = "package example\nfun example() = A.make().action()\n";
+    indexer.index_content(&uri, source);
+    indexer.store_live_tree(&uri, source);
+    let position = Position::new(
+        1,
+        source.lines().nth(1).unwrap().find(".action").unwrap() as u32 + 1,
+    );
+    let context = CursorContext::build(&indexer, &uri, position).unwrap();
+    let hover = compute_hover(&indexer, &context, &uri, position).expect("nested result hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("The correct result."), "{text}");
+    assert!(!text.contains("The wrong result."), "{text}");
+}
+
+#[tokio::test]
+async fn hover_resolves_multiline_java_library_builder_chain() {
+    use std::sync::Arc;
+
+    let library = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        library.path().join("Provider.java"),
+        r#"package app;
+import app.SqlConfiguration.SqlConfigurationBuilder;
+public class Provider {
+    public static final class Configuration extends SqlConfiguration {
+        public static Configuration.Builder builder() { return new Builder(); }
+        public static final class Builder extends SqlConfigurationBuilder<Builder> {
+            /** Configures the JDBC template. */
+            public Builder withJdbcTemplate(JdbcTemplate jdbcTemplate) { return this; }
+            /** Creates the JDBC configuration. */
+            public Provider.Configuration build() { return null; }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        library.path().join("SqlConfiguration.java"),
+        r#"package app;
+public class SqlConfiguration {
+    public abstract static class SqlConfigurationBuilder<T extends SqlConfigurationBuilder<T>> {
+        /** Uses the database clock. */
+        public T usingDbTime() { return null; }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let indexer = Arc::new(Indexer::new());
+    *indexer.source_paths_raw.write().unwrap() = vec![library.path().to_str().unwrap().to_owned()];
+    Arc::clone(&indexer)
+        .index_source_paths(workspace.path().to_owned())
+        .await;
+    // Source-attached dependencies also remain in the compiled JAR index.
+    // Keep both copies, alongside unrelated classes with the same leaf name.
+    for filename in ["Provider.java", "SqlConfiguration.java"] {
+        let source_uri = Url::from_file_path(library.path().join(filename)).unwrap();
+        let data = crate::resolver::ensure_file_data(&indexer, &source_uri).unwrap();
+        let compiled_uri =
+            Url::parse(&format!("jar:file:///dependency.jar!/app/{filename}")).unwrap();
+        indexer
+            .jar_files
+            .insert(compiled_uri.to_string(), Arc::clone(&data));
+        for symbol in &data.symbols {
+            indexer
+                .jar_definitions
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(Location {
+                    uri: compiled_uri.clone(),
+                    range: symbol.selection_range,
+                });
+        }
+    }
+    let competing_uri = Url::from_file_path(workspace.path().join("Other.java")).unwrap();
+    indexer.index_content(&competing_uri, "package unrelated; public class Other { public static class Builder { public Builder withJdbcTemplate(Object wrong) { return this; } public String usingDbTime() { return null; } public String build() { return null; } } }");
+    let decoy_uri = Url::from_file_path(workspace.path().join("MemoryFileStore.kt")).unwrap();
+    indexer.index_content(
+        &decoy_uri,
+        "package unrelated\nclass URLBuilder\nval builder: URLBuilder = URLBuilder()\nfun build(): String = \"wrong\"\n",
+    );
+    let uri = Url::from_file_path(workspace.path().join("Example.kt")).unwrap();
+    for separator in ["", "\n        "] {
+        let source = format!(
+            "package example\nimport app.Provider\nimport org.springframework.jdbc.core.JdbcTemplate\nfun example() =\n    Provider.Configuration{separator}.builder(){separator}.withJdbcTemplate(JdbcTemplate()){separator}.usingDbTime(){separator}.build()\n"
+        );
+        indexer.index_content(&uri, &source);
+        indexer.store_live_tree(&uri, &source);
+        for (method, expected) in [
+            ("builder", "Configuration.Builder"),
+            ("withJdbcTemplate", "Builder"),
+            ("usingDbTime", "usingDbTime"),
+            ("build", "Configuration"),
+        ] {
+            let needle = format!(".{method}(");
+            let byte_offset = source.find(&needle).unwrap() + 1;
+            let prefix = &source[..byte_offset];
+            let position = Position::new(
+                prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
+                prefix.rsplit('\n').next().unwrap().len() as u32,
+            );
+            let context = CursorContext::build(&indexer, &uri, position).unwrap();
+            let hover =
+                compute_hover(indexer.as_ref(), &context, &uri, position).unwrap_or_else(|| {
+                    panic!("missing hover for {method} with separator {separator:?}")
+                });
+            let text = hover_text(&hover);
+            assert!(text.contains(&format!("{method}(")), "{method}: {text}");
+            assert!(text.contains(expected), "{method}: {text}");
+            let documentation = match method {
+                "withJdbcTemplate" => Some("Configures the JDBC template."),
+                "usingDbTime" => Some("Uses the database clock."),
+                "build" => Some("Creates the JDBC configuration."),
+                _ => None,
+            };
+            if let Some(documentation) = documentation {
+                assert!(text.contains(documentation), "{method}: {text}");
+            }
+            assert!(
+                !text.contains("URLBuilder") && !text.contains("wrong"),
+                "{method}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hover_preserves_source_jar_builder_identity_after_generic_calls() {
+    let indexer = Indexer::new();
+    crate::indexer::jar::index_jar_entries(
+        &indexer,
+        vec![
+            (
+                Url::parse("jar:file:///provider-sources.jar!/Provider.java").unwrap(),
+                r#"package app;
+import app.Base;
+public class Provider {
+    public static class Configuration {
+        public static Configuration.Builder builder() { return null; }
+        public static class Builder extends Base<Builder> {
+            public Configuration build() { return null; }
+        }
+    }
+}
+"#
+                .to_owned(),
+            ),
+            (
+                Url::parse("jar:file:///base-sources.jar!/Base.java").unwrap(),
+                r#"package app;
+public class Base<T> {
+    public T configure() { return null; }
+}
+"#
+                .to_owned(),
+            ),
+            (
+                Url::parse("jar:file:///other-sources.jar!/Other.java").unwrap(),
+                r#"package unrelated;
+public class Other {
+    public static class Builder {
+        public String build() { return null; }
+    }
+}
+"#
+                .to_owned(),
+            ),
+        ],
+    );
+    let uri = Url::parse("file:///example/Example.kt").unwrap();
+    let source = "package example\nimport app.Provider\nfun example() = Provider.Configuration.builder().configure().build()\n";
+    indexer.index_content(&uri, source);
+    indexer.store_live_tree(&uri, source);
+    let position = Position::new(
+        2,
+        source.lines().nth(2).unwrap().find(".build()").unwrap() as u32 + 1,
+    );
+    let context = CursorContext::build(&indexer, &uri, position).unwrap();
+    let hover =
+        compute_hover(&indexer, &context, &uri, position).expect("source JAR builder hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("Configuration build()"), "{text}");
+    assert!(!text.contains("String build()"), "{text}");
+}
+
+#[test]
+fn hover_preserves_value_receiver_identity_in_nested_accesses() {
+    let indexer = Indexer::new();
+    let uri = Url::parse("file:///example/Values.kt").unwrap();
+    for receiver in ["holder.foo", "holder.getFoo()"] {
+        let source = format!(
+            r#"package example
+class Foo {{
+    /** The instance action. */
+    fun action(): String = "instance"
+    companion object {{
+        /** The companion action, never the value target. */
+        fun action(): String = "companion"
+        /** Only available on the companion. */
+        fun missing(): String = "wrong"
+    }}
+}}
+class Holder(val foo: Foo) {{
+    fun getFoo(): Foo = foo
+}}
+fun example(holder: Holder) {{
+    {receiver}.action()
+    {receiver}.missing()
+}}
+"#
+        );
+        indexer.index_content(&uri, &source);
+        indexer.store_live_tree(&uri, &source);
+        for method in ["action", "missing"] {
+            let line = source
+                .lines()
+                .position(|line| line.contains(&format!("{receiver}.{method}()")))
+                .unwrap();
+            let column = source
+                .lines()
+                .nth(line)
+                .unwrap()
+                .find(&format!(".{method}"))
+                .unwrap()
+                + 1;
+            let position = Position::new(line as u32, column as u32);
+            let context = CursorContext::build(&indexer, &uri, position).unwrap();
+            let hover = compute_hover(&indexer, &context, &uri, position);
+            if method == "action" {
+                let text = hover_text(&hover.expect("instance action hover"));
+                assert!(text.contains("The instance action."), "{receiver}: {text}");
+                assert!(!text.contains("companion"), "{receiver}: {text}");
+            } else {
+                assert!(
+                    hover.is_none(),
+                    "must not show companion-only docs for {receiver}"
+                );
+            }
+        }
+    }
+}
+
 /// Same reported bug as goto-definition's regression test, reached through
 /// hover's separate `resolve_symbol_info` path instead of
 /// `find_definition`: hovering the inner `collect(block)` must not show

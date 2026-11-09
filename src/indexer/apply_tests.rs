@@ -716,7 +716,7 @@ fn reset_index_state_mixed_extension_receiver_no_deadlock() {
 #[test]
 fn classify_source_set_handles_flavored_kmp_test_sets() {
     use crate::types::SourceSet;
-    let classify = |path: &str| super::classify_source_set(path, &[]);
+    let classify = |path: &str| super::classify_source_set(path, &[], None);
     assert_eq!(
         classify("file:///p/app/src/main/kotlin/A.kt"),
         SourceSet::Main
@@ -749,6 +749,122 @@ fn classify_source_set_handles_flavored_kmp_test_sets() {
         classify("file:///p/shared/src/iosTest/kotlin/A.kt"),
         SourceSet::Test
     );
+}
+
+/// Resolved Gradle project roots must retain main/test scope on both workspace
+/// cache apply and source-path cache restore, including old Library metadata.
+#[test]
+fn resolved_gradle_layout_keeps_project_scope_on_warm_apply() {
+    use crate::types::SourceSet;
+    use crate::workspace::Config;
+    use std::collections::HashMap;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::write(root.join("build.gradle.kts"), "").unwrap();
+    let mut chunk = HashMap::new();
+    let mut expected = Vec::new();
+    for (source_set, scope) in [("main", SourceSet::Main), ("test", SourceSet::Test)] {
+        let source_directory = root.join("src").join(source_set).join("kotlin");
+        std::fs::create_dir_all(&source_directory).unwrap();
+        let path = source_directory.join("Example.kt");
+        std::fs::write(&path, "internal class Example").unwrap();
+        let file_uri = Url::from_file_path(&path).unwrap();
+        let mut parsed = Indexer::parse_file(&file_uri, "internal class Example");
+        parsed.data.source_set = SourceSet::Library;
+        chunk.insert(
+            path.to_string_lossy().into_owned(),
+            FileCacheEntry {
+                mtime_secs: 0,
+                file_size: 0,
+                content_hash: parsed.content_hash,
+                file_data: Arc::new(parsed.data),
+                qualified_keys: vec![],
+            },
+        );
+        expected.push((file_uri, scope));
+    }
+    let config = Config {
+        root: root.to_path_buf(),
+        explicit_source_paths: vec![],
+        ignore_patterns: vec![],
+        jar_paths: vec![],
+        pin_workspace: false,
+    };
+    let indexer = Indexer::new();
+    indexer.workspace_root.set(root.to_path_buf());
+    *indexer.source_paths_raw.write().unwrap() = config.resolve_sources();
+    for source_set in ["main", "test"] {
+        let source_path = root.join("src").join(source_set).join("kotlin");
+        assert!(indexer
+            .source_paths_raw
+            .read()
+            .unwrap()
+            .contains(&source_path.to_string_lossy().into_owned()));
+    }
+    let cached_files = chunk
+        .iter()
+        .map(|(path, entry)| cache_entry_to_file_result(&Url::from_file_path(path).unwrap(), entry))
+        .collect();
+    indexer.apply_workspace_result(WorkspaceIndexResult {
+        files: cached_files,
+        stats: IndexStats {
+            cache_hits: 2,
+            ..Default::default()
+        },
+        workspace_root: root.to_path_buf(),
+        aborted: false,
+        complete_scan: true,
+    });
+    for (file_uri, scope) in &expected {
+        assert_eq!(
+            indexer.files.get(file_uri.as_str()).unwrap().source_set,
+            *scope
+        );
+    }
+    assert!(crate::indexer::jar::workspace_has_jvm_sources(&indexer));
+
+    indexer.restore_library_chunk(chunk, root);
+    for (file_uri, scope) in &expected {
+        assert_eq!(
+            indexer.files.get(file_uri.as_str()).unwrap().source_set,
+            *scope
+        );
+        assert!(!indexer.library_uris.contains(file_uri.as_str()));
+    }
+    assert!(crate::indexer::jar::workspace_has_jvm_sources(&indexer));
+}
+
+#[test]
+fn explicit_external_sources_remain_library_with_workspace_root() {
+    use crate::types::SourceSet;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project");
+    let library = directory.path().join("project-library/src/test/kotlin");
+    let indexer = Indexer::new();
+    indexer.workspace_root.set(root.clone());
+    *indexer.source_paths_raw.write().unwrap() = vec![library.to_string_lossy().into_owned()];
+    let library_uri = Url::from_file_path(library.join("Dependency.kt")).unwrap();
+    let data = indexer
+        .index_content(&library_uri, "class Dependency")
+        .unwrap();
+    assert_eq!(data.source_set, SourceSet::Library);
+    assert!(!crate::indexer::jar::workspace_has_jvm_sources(&indexer));
+
+    // In-workspace sourcePaths are project roots, just as in the source scanner.
+    let project_sources = root.join("src/test/kotlin");
+    indexer
+        .source_paths_raw
+        .write()
+        .unwrap()
+        .push(project_sources.to_string_lossy().into_owned());
+    let project_uri = Url::from_file_path(project_sources.join("ProjectTest.kt")).unwrap();
+    let data = indexer
+        .index_content(&project_uri, "class ProjectTest")
+        .unwrap();
+    assert_eq!(data.source_set, SourceSet::Test);
+    assert!(crate::indexer::jar::workspace_has_jvm_sources(&indexer));
 }
 
 /// Tier 1 (`jar_bare_names`) names must be offered by bare-word completion

@@ -35,10 +35,297 @@ pub(crate) fn compute_hover<W: WorkspaceRead>(
     if ctx.qualifier.is_none() && ctx.lambda_decl.is_some() {
         return jar_loading_hint(workspace);
     }
+    if let Some(hover) = cst_member_hover(workspace, uri, position) {
+        return hover.or_else(|| jar_loading_hint(workspace));
+    }
     if let Some(hover) = contextual_receiver_hover(workspace, ctx, uri, position) {
         return Some(hover);
     }
     regular_symbol_hover(workspace, ctx, uri, position).or_else(|| jar_loading_hint(workspace))
+}
+
+/// Reuse navigation's CST receiver resolution for complete expressions, including
+/// multiline fluent chains that the line-based cursor qualifier cannot represent.
+/// A resolved but ambiguous member must not fall through to a name-only lookup.
+fn cst_member_hover<W: WorkspaceRead>(
+    workspace: &W,
+    uri: &Url,
+    position: Position,
+) -> Option<Option<Hover>> {
+    let indexer = workspace.as_indexer()?;
+    let document = indexer.live_doc_or_parse(uri)?;
+    let node = crate::indexer::cursor_node_at(
+        &document,
+        crate::types::CursorPos {
+            line: position.line as usize,
+            utf16_col: position.character as usize,
+        },
+    )?;
+    let navigation = crate::indexer::enclosing_nav_expr_if_member(node)?;
+    let name = node.utf8_text(&document.bytes).ok()?;
+    let locations = navigation_declarations(indexer, &document, navigation, uri, 0)?;
+    Some((|| {
+        let location =
+            pick_unambiguous_location(call_shape_ctx(workspace, uri, position), locations)?;
+        let info = enrich_at_location(
+            workspace,
+            &location,
+            name,
+            hover_substitution_context(uri, position.line),
+            &ResolveOptions::hover(),
+        )?;
+        Some(make_markdown_hover(format_symbol_hover(&info, uri.path())))
+    })())
+}
+
+/// Keep value receivers as values: a resolved `Foo` value must never become
+/// the textual type qualifier `Foo` (which prefers companion members).
+fn navigation_declarations(
+    indexer: &crate::indexer::Indexer,
+    document: &crate::indexer::LiveDoc,
+    navigation: tree_sitter::Node<'_>,
+    uri: &Url,
+    depth: usize,
+) -> Option<Vec<Location>> {
+    if depth > 32 {
+        return Some(vec![]);
+    }
+    let receiver = crate::indexer::navigation_receiver_node(navigation)?;
+    let member = crate::indexer::navigation_member_ident(navigation)?;
+    let name = member.utf8_text(&document.bytes).ok()?;
+    let text = receiver.utf8_text(&document.bytes).ok()?;
+    if text.chars().all(|character| {
+        character.is_alphanumeric()
+            || character == '_'
+            || character == '.'
+            || character.is_whitespace()
+    }) {
+        let qualifier: String = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        if let Some(narrowed) = crate::resolver::infer_receiver_type_at(
+            indexer,
+            &qualifier,
+            uri,
+            Position::new(
+                member.start_position().row as u32,
+                member.start_position().column as u32,
+            ),
+        ) {
+            let declarations = crate::resolver::resolve::resolve_type_index_only(
+                indexer,
+                &narrowed.qualified,
+                uri,
+            );
+            return declaration_members(indexer, name, declarations, uri);
+        }
+        if qualifier.chars().next().is_some_and(char::is_uppercase) {
+            return Some(indexer.resolve_member_only(name, &qualifier, uri));
+        }
+    }
+    let declarations = expression_type_declarations(indexer, document, receiver, uri, depth + 1)?;
+    declaration_members(indexer, name, declarations, uri)
+}
+
+fn declaration_members(
+    indexer: &crate::indexer::Indexer,
+    name: &str,
+    declarations: Vec<Location>,
+    uri: &Url,
+) -> Option<Vec<Location>> {
+    let mut locations = Vec::new();
+    for declaration in declarations {
+        let own = instance_members(indexer, name, &declaration);
+        if !own.is_empty() {
+            locations.extend(own);
+            continue;
+        }
+        let file = crate::resolver::ensure_file_data(indexer, &declaration.uri)?;
+        let class = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.selection_range == declaration.range)?;
+        locations.extend(crate::resolver::walk_hierarchy(
+            indexer,
+            &class.name,
+            declaration.uri.as_str(),
+            crate::types::CallerContext {
+                uri: Some(uri.as_str()),
+                ..Default::default()
+            },
+            16,
+            crate::resolver::MAX_SYNC_JAR_PROMOTIONS_PER_HIERARCHY_WALK,
+            |indexer, class_name, class_uri, _| {
+                crate::resolver::find::find_all_names_with_container_in_uri(
+                    indexer, name, class_name, class_uri,
+                )
+            },
+        ));
+    }
+    Some(locations)
+}
+
+fn instance_members(
+    indexer: &crate::indexer::Indexer,
+    name: &str,
+    declaration: &Location,
+) -> Vec<Location> {
+    let Some(file) = crate::resolver::ensure_file_data(indexer, &declaration.uri) else {
+        return vec![];
+    };
+    let Some(class) = file
+        .symbols
+        .iter()
+        .find(|symbol| symbol.selection_range == declaration.range)
+    else {
+        return vec![];
+    };
+    file.symbols
+        .iter()
+        .filter(|symbol| {
+            let immediate_owner = symbol.container.as_deref() == Some(class.name.as_str());
+            let degenerate_range = class.range == class.selection_range;
+            let inside_class =
+                crate::resolver::container::range_encloses(class.range, symbol.range);
+            symbol.name == name && immediate_owner && (degenerate_range || inside_class)
+        })
+        .map(|symbol| Location {
+            uri: declaration.uri.clone(),
+            range: symbol.selection_range,
+        })
+        .collect()
+}
+
+/// Resolve a call result's type in its declaration's scope, not the editing
+/// file. Java's `Builder` return spelling is otherwise ambiguous across JARs.
+fn expression_type_declarations(
+    indexer: &crate::indexer::Indexer,
+    document: &crate::indexer::LiveDoc,
+    expression: tree_sitter::Node<'_>,
+    uri: &Url,
+    depth: usize,
+) -> Option<Vec<Location>> {
+    if depth > 32 {
+        return Some(vec![]);
+    }
+    if expression.kind() != "call_expression" {
+        let receiver_type = crate::indexer::CstQuery::new(expression, document, indexer, uri)
+            .expr_type()
+            .resolved()?;
+        return Some(crate::resolver::resolve::resolve_type_index_only(
+            indexer,
+            receiver_type.as_type_str(),
+            uri,
+        ));
+    }
+    let callee = expression.named_child(0)?;
+    let Some(candidates) = navigation_declarations(indexer, document, callee, uri, depth + 1)
+    else {
+        let receiver_type = crate::indexer::CstQuery::new(expression, document, indexer, uri)
+            .expr_type()
+            .resolved()?;
+        return Some(crate::resolver::resolve::resolve_type_index_only(
+            indexer,
+            receiver_type.as_type_str(),
+            uri,
+        ));
+    };
+    let shape = crate::indexer::call_shape_of(expression, &document.bytes);
+    let Some(method) = pick_unambiguous_location(Some((indexer, shape)), candidates) else {
+        return Some(vec![]);
+    };
+    let file = crate::resolver::ensure_file_data(indexer, &method.uri)?;
+    let symbol = file
+        .symbols
+        .iter()
+        .find(|symbol| symbol.selection_range == method.range)?;
+    let declared = crate::rg::declared_type_from_detail(&symbol.detail, symbol.kind)?;
+    let generic_return = symbol.type_params().contains(&declared)
+        || file.symbols.iter().any(|class| {
+            symbol.container.as_deref() == Some(class.name.as_str())
+                && class.type_params().contains(&declared)
+        });
+    if !generic_return {
+        let candidates =
+            crate::resolver::resolve::resolve_type_index_only(indexer, &declared, &method.uri);
+        let mut scopes: Vec<_> = file
+            .symbols
+            .iter()
+            .filter(|scope| {
+                matches!(
+                    scope.kind,
+                    tower_lsp::lsp_types::SymbolKind::CLASS
+                        | tower_lsp::lsp_types::SymbolKind::INTERFACE
+                        | tower_lsp::lsp_types::SymbolKind::STRUCT
+                ) && crate::resolver::container::range_encloses(scope.range, method.range)
+            })
+            .collect();
+        scopes.sort_by_key(|scope| {
+            (
+                scope.range.end.line - scope.range.start.line,
+                scope
+                    .range
+                    .end
+                    .character
+                    .saturating_sub(scope.range.start.character),
+            )
+        });
+        for scope in scopes {
+            let scoped: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.uri == method.uri
+                        && file.symbols.iter().any(|target| {
+                            target.selection_range == candidate.range
+                                && target.container.as_deref() == Some(scope.name.as_str())
+                                && crate::resolver::container::range_encloses(
+                                    scope.range,
+                                    target.range,
+                                )
+                        })
+                })
+                .cloned()
+                .collect();
+            if !scoped.is_empty() {
+                return Some(scoped);
+            }
+        }
+        return Some(candidates);
+    }
+    let previous = crate::indexer::navigation_receiver_node(callee)?;
+    let receivers = expression_type_declarations(indexer, document, previous, uri, depth + 1)?;
+    let mut declarations = Vec::new();
+    for receiver in receivers {
+        let receiver_file = crate::resolver::ensure_file_data(indexer, &receiver.uri)?;
+        let class = receiver_file
+            .symbols
+            .iter()
+            .find(|class| class.selection_range == receiver.range)?;
+        let Some(substituted) = crate::resolver::infer::find_method_return_type_via_supertypes(
+            indexer,
+            &class.name,
+            &symbol.name,
+            Some(&receiver.uri),
+        ) else {
+            continue;
+        };
+        let receiver_name = crate::resolver::infer::qualify_source_jar_return_type(
+            &receiver_file,
+            &receiver.uri,
+            class.name.clone(),
+        );
+        if substituted == receiver_name {
+            declarations.push(receiver);
+        } else if substituted != declared {
+            declarations.extend(crate::resolver::resolve::resolve_type_index_only(
+                indexer,
+                &substituted,
+                &receiver.uri,
+            ));
+        }
+    }
+    Some(declarations)
 }
 
 fn contextual_lambda_hover<W: WorkspaceRead>(

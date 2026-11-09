@@ -33,7 +33,23 @@ use crate::types::{
 };
 use crate::StrExt;
 
-fn classify_source_set(uri: &str, source_paths: &[String]) -> SourceSet {
+fn classify_source_set(
+    uri: &str,
+    source_paths: &[String],
+    workspace_root: Option<&Path>,
+) -> SourceSet {
+    // sourcePaths also includes auto-detected project roots. Match the source-path
+    // scanner's workspace boundary rather than treating those roots as libraries.
+    let is_workspace_source = workspace_root
+        .zip(Url::parse(uri).ok().and_then(|url| url.to_file_path().ok()))
+        .is_some_and(|(root, path)| path.starts_with(root));
+    if is_workspace_source {
+        return if is_test_source_set(uri) {
+            SourceSet::Test
+        } else {
+            SourceSet::Main
+        };
+    }
     for source_path in source_paths {
         let normalized = to_forward_slash(std::path::Path::new(source_path));
         if uri.contains(&normalized) {
@@ -522,7 +538,7 @@ impl Indexer {
             .source_paths_raw
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        classify_source_set(uri, &guard)
+        classify_source_set(uri, &guard, self.workspace_root.get().as_deref())
     }
 
     fn with_classified_source_set(&self, uri: &str, file_data: Arc<FileData>) -> Arc<FileData> {
@@ -620,7 +636,8 @@ impl Indexer {
             }
         }
         for key in &stale.qualified_keys {
-            self.qualified.remove(key);
+            self.qualified
+                .remove_if(key, |_, location| location.file == stale_id);
         }
         if let Some(ref pkg) = stale.package {
             if let Some(mut file_ids) = self.packages.get_mut(pkg) {
@@ -633,6 +650,45 @@ impl Indexer {
         for mut entry in self.extension_by_receiver.iter_mut() {
             entry.value_mut().retain(|e| e.file_uri != uri_str);
         }
+    }
+
+    /// Drop retained extracted libraries outside the newly configured source scope.
+    pub(crate) fn prune_source_path_libraries(&self, workspace_root: &Path) {
+        let raw_paths = self.source_paths_raw.read().unwrap().clone();
+        let paths = resolve_source_paths(&raw_paths, workspace_root);
+        let removed: Vec<Url> = self
+            .library_uris
+            .iter()
+            .filter_map(|uri| Url::parse(uri.as_str()).ok())
+            .filter(|uri| {
+                let Ok(path) = uri.to_file_path() else {
+                    return false;
+                };
+                !paths.iter().any(|root| path.starts_with(root))
+            })
+            .collect();
+        self.remove_source_files(&removed);
+    }
+
+    /// Remove source files without touching the separate compiled-JAR maps.
+    pub(crate) fn remove_source_files(&self, uris: &[Url]) {
+        if uris.is_empty() {
+            return;
+        }
+        for uri in uris {
+            self.remove_stale_for_uri(uri.as_str());
+            self.remove_indexed_file(uri);
+            self.content_hashes.remove(uri.as_str());
+            self.library_uris.remove(uri.as_str());
+        }
+        self.definitions
+            .retain(|_, locations| !locations.is_empty());
+        self.packages.retain(|_, files| !files.is_empty());
+        self.subtypes.retain(|_, locations| !locations.is_empty());
+        self.extension_by_receiver
+            .retain(|_, entries| !entries.is_empty());
+        self.bare_names_dirty.store(true, Ordering::Release);
+        self.invalidate_completion_cache();
     }
 
     /// Coordinator: apply workspace indexing results to the index.

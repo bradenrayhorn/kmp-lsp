@@ -7,6 +7,85 @@ use crate::indexer::test_helpers::ENV_VAR_LOCK;
 use std::fs;
 use tempfile::TempDir;
 
+#[test]
+fn manifest_cli_sources_override_global_fallback() {
+    let _guard = ENV_VAR_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let home = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let default_sources = home.path().join(".kmp-lsp/sources");
+    fs::create_dir_all(&default_sources).unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    let result = std::panic::catch_unwind(|| {
+        let default_path = default_sources.to_string_lossy().into_owned();
+        assert!(super::collect_cli_source_paths(root.path(), false).contains(&default_path));
+        fs::write(
+            root.path().join("workspace.json"),
+            r#"{"dependencyManifest":"deps.json"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("deps.json"),
+            r#"{"compiledJars":[],"sourceJars":[]}"#,
+        )
+        .unwrap();
+        assert!(!super::collect_cli_source_paths(root.path(), false).contains(&default_path));
+        fs::write(root.path().join("deps.json"), "malformed").unwrap();
+        assert!(!super::collect_cli_source_paths(root.path(), false).contains(&default_path));
+        fs::write(
+            root.path().join("workspace.json"),
+            serde_json::json!({
+                "dependencyManifest": "deps.json", "sourcePaths": [default_path]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(super::collect_cli_source_paths(root.path(), false).contains(&default_path));
+        assert!(!super::collect_cli_source_paths(root.path(), true).contains(&default_path));
+    });
+    match previous_home {
+        Some(previous) => std::env::set_var("HOME", previous),
+        None => std::env::remove_var("HOME"),
+    }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+async fn build_index_loads_manifest_sources_once_unless_no_stdlib() {
+    use std::io::Write;
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("workspace.json"),
+        r#"{"dependencyManifest":"deps.json"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("deps.json"),
+        r#"{"compiledJars":[],"sourceJars":["fixture-sources.jar"]}"#,
+    )
+    .unwrap();
+    let mut archive =
+        zip::ZipWriter::new(fs::File::create(root.path().join("fixture-sources.jar")).unwrap());
+    archive
+        .start_file("Fixture.kt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive
+        .write_all(b"package fixture\nclass ManifestFixture")
+        .unwrap();
+    archive.finish().unwrap();
+    let indexer = super::build_index(root.path(), false).await;
+    assert_eq!(indexer.definition_locations("ManifestFixture").len(), 1);
+    assert!(indexer.qualified.contains_key("fixture.ManifestFixture"));
+    let workspace_only = super::build_index(root.path(), true).await;
+    assert!(workspace_only
+        .definition_locations("ManifestFixture")
+        .is_empty());
+}
+
 /// Run `f` with both `ANDROID_HOME` and `ANDROID_SDK_ROOT` unset — CI
 /// runners (GitHub-hosted `ubuntu-latest`/`macos-latest`/`windows-latest`)
 /// ship a real, pre-installed Android SDK with these set, which would

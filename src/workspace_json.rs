@@ -45,6 +45,77 @@ struct WorkspaceData {
     jar_paths: Option<Vec<String>>,
 }
 
+/// Exact project dependency lists; an empty manifest disables cache discovery.
+#[derive(Debug, Default)]
+pub(crate) struct DependencyManifest {
+    pub(crate) compiled_jars: Vec<PathBuf>,
+    pub(crate) source_jars: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DependencyManifestData {
+    compiled_jars: Vec<String>,
+    source_jars: Vec<String>,
+}
+
+/// `None` preserves cache discovery. Invalid configuration is fail-closed:
+/// warn and return an empty manifest, never enable shared-cache fallback.
+pub(crate) fn load_dependency_manifest(workspace_root: &Path) -> Option<DependencyManifest> {
+    match read_dependency_manifest(workspace_root) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            log::warn!("dependencyManifest: {error}; shared dependency scanning disabled");
+            Some(DependencyManifest::default())
+        }
+    }
+}
+
+fn read_dependency_manifest(workspace_root: &Path) -> Result<Option<DependencyManifest>, String> {
+    let workspace_path = workspace_root.join("workspace.json");
+    if !workspace_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&workspace_path).map_err(|error| error.to_string())?;
+    let workspace: serde_json::Value =
+        serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    let Some(setting) = workspace.get("dependencyManifest") else {
+        return Ok(None);
+    };
+    let spec = setting.as_str().ok_or("expected a string path")?;
+    let resolve = |spec: &str| {
+        let path =
+            PathBuf::from(spec.replace(WORKSPACE_PLACEHOLDER, &workspace_root.to_string_lossy()));
+        if path.is_absolute() {
+            path
+        } else {
+            workspace_root.join(path)
+        }
+    };
+    let manifest_path = resolve(spec);
+    let content = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+    let data: DependencyManifestData = serde_json::from_str(&content)
+        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+    let resolve_files = |specs: Vec<String>| -> Result<Vec<PathBuf>, String> {
+        specs
+            .into_iter()
+            .map(|spec| {
+                let path = resolve(&spec);
+                if path.is_file() {
+                    Ok(path)
+                } else {
+                    Err(format!("artifact is not a file: {}", path.display()))
+                }
+            })
+            .collect()
+    };
+    Ok(Some(DependencyManifest {
+        compiled_jars: resolve_files(data.compiled_jars)?,
+        source_jars: resolve_files(data.source_jars)?,
+    }))
+}
+
 #[derive(Deserialize)]
 struct ModuleData {
     /// Parsed for schema fidelity; module identity for dependency-scoping

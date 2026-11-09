@@ -40,6 +40,315 @@ fn subject_segments_returns_the_full_chain_for_a_bare_navigation_expression_node
 }
 
 #[test]
+fn source_jar_return_qualification_preserves_explicit_and_ambiguous_types() {
+    use crate::indexer::Indexer;
+    use tower_lsp::lsp_types::Url;
+
+    let indexer = Indexer::new();
+    let uri = Url::parse("jar:file:///types-sources.jar!/Types.java").unwrap();
+    indexer.index_content(
+        &uri,
+        r#"package app;
+class Outer {
+    static class Builder {}
+    static class Result {}
+}
+class Other {
+    static class Result {}
+}
+"#,
+    );
+    let data = indexer.files.get(uri.as_str()).unwrap();
+    for (raw, expected) in [
+        ("Builder", "Outer.Builder"),
+        ("Outer.Builder", "Outer.Builder"),
+        ("other.Builder", "other.Builder"),
+        ("Result", "Result"),
+    ] {
+        assert_eq!(
+            super::qualify_source_jar_return_type(&data, &uri, raw.to_owned()),
+            expected
+        );
+    }
+}
+
+#[test]
+fn java_nested_builder_method_return_types() {
+    use crate::indexer::Indexer;
+    use crate::resolver::Resolver;
+    use tower_lsp::lsp_types::Url;
+
+    let indexer = Indexer::new();
+    let java_uri = Url::parse("file:///app/JdbcTemplateLockProvider.java").unwrap();
+    indexer.index_content(
+        &java_uri,
+        r#"package app;
+public class JdbcTemplateLockProvider {
+    public static class Configuration {
+        public static Builder builder() { return new Builder(); }
+        public static class Builder extends SqlConfigurationBuilder<Builder> {
+            public Builder withJdbcTemplate(Object template) { return this; }
+            public Configuration build() { return null; }
+        }
+    }
+}
+"#,
+    );
+    let base_uri = Url::parse("file:///app/SqlConfigurationBuilder.java").unwrap();
+    indexer.index_content(
+        &base_uri,
+        r#"package app;
+public class SqlConfigurationBuilder<T> {
+    public T usingDbTime() { return null; }
+}
+"#,
+    );
+    for (receiver, method, expected) in [
+        ("Configuration", "builder", "Builder"),
+        ("Builder", "withJdbcTemplate", "Builder"),
+        ("Builder", "usingDbTime", "Builder"),
+        ("Builder", "build", "Configuration"),
+    ] {
+        assert_eq!(
+            indexer
+                .method_return_type(receiver, method, Some(&java_uri))
+                .map(|result| result.into_inner()),
+            Some(expected.to_owned()),
+            "{receiver}.{method}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn java_library_nested_builder_method_return_types() {
+    use crate::indexer::Indexer;
+    use crate::resolver::Resolver;
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::Url;
+
+    let library = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let provider_path = library.path().join("JdbcTemplateLockProvider.java");
+    std::fs::write(
+        &provider_path,
+        r#"package app;
+import app.SqlConfiguration.SqlConfigurationBuilder;
+public class JdbcTemplateLockProvider {
+    public static final class Configuration extends SqlConfiguration {
+        public static Configuration.Builder builder() { return new Configuration.Builder(); }
+        public static final class Builder extends SqlConfigurationBuilder<Builder> {
+            public Builder withJdbcTemplate(Object template) { return this; }
+            public Configuration build() { return null; }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        library.path().join("SqlConfiguration.java"),
+        r#"package app;
+public class SqlConfiguration {
+    public abstract static class SqlConfigurationBuilder<T extends SqlConfigurationBuilder<T>> {
+        public T usingDbTime() { return null; }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let indexer = Arc::new(Indexer::new());
+    *indexer.source_paths_raw.write().unwrap() = vec![library.path().to_str().unwrap().to_owned()];
+    Arc::clone(&indexer)
+        .index_source_paths(workspace.path().to_owned())
+        .await;
+    // Restore through the public warm-cache path too: library entries omit lines.
+    let restored = Arc::new(Indexer::new());
+    *restored.source_paths_raw.write().unwrap() = vec![library.path().to_str().unwrap().to_owned()];
+    Arc::clone(&restored)
+        .index_source_paths(workspace.path().to_owned())
+        .await;
+    let indexer = restored;
+    let provider_uri = Url::from_file_path(&provider_path).unwrap();
+    assert!(indexer
+        .files
+        .get(provider_uri.as_str())
+        .unwrap()
+        .lines
+        .is_empty());
+    assert!(
+        indexer
+            .files
+            .get(provider_uri.as_str())
+            .unwrap()
+            .supers
+            .iter()
+            .any(|(_, name, arguments)| name == "SqlConfigurationBuilder"
+                && arguments == &["Builder"])
+    );
+    // Inference must use cached metadata, not reopen the source to recover arguments.
+    std::fs::remove_file(&provider_path).unwrap();
+    assert!(indexer.is_library_uri(&provider_uri));
+    assert!(indexer
+        .workspace_def_candidates("SqlConfigurationBuilder")
+        .is_empty());
+    indexer.index_content(
+        &Url::from_file_path(workspace.path().join("Unrelated.java")).unwrap(),
+        "package unrelated;\npublic class SqlConfigurationBuilder<Wrong> {\n    public Wrong usingDbTime() { return null; }\n}\n",
+    );
+    for (receiver, method, expected) in [
+        ("Configuration", "builder", "Configuration.Builder"),
+        ("Configuration.Builder", "withJdbcTemplate", "Builder"),
+        ("Builder", "usingDbTime", "Builder"),
+    ] {
+        assert_eq!(
+            indexer
+                .method_return_type(receiver, method, Some(&provider_uri))
+                .map(|result| result.into_inner()),
+            Some(expected.to_owned()),
+            "{receiver}.{method}",
+        );
+    }
+}
+
+#[test]
+fn source_jar_nested_builder_method_return_types() {
+    use crate::indexer::Indexer;
+    use crate::resolver::Resolver;
+    use tower_lsp::lsp_types::Url;
+
+    let indexer = Indexer::new();
+    let provider_uri =
+        Url::parse("jar:file:///lib/provider-sources.jar!/app/Provider.java").unwrap();
+    let base_uri = Url::parse("jar:file:///lib/core-sources.jar!/app/Base.java").unwrap();
+    crate::indexer::jar::index_jar_entries(&indexer, vec![
+        (provider_uri.clone(), "package app;\npublic class Provider {\n    public static class Configuration {\n        public static Configuration.Builder builder() { return null; }\n        public static class Builder extends Base<Builder> {\n            public Builder withTemplate(Object template) { return this; }\n            public Configuration build() { return null; }\n        }\n    }\n}\n".to_owned()),
+        (base_uri, "package app;\npublic class Base<T> {\n    public T usingDbTime() { return null; }\n}\n".to_owned()),
+    ]);
+    // Warm source-cache entries can have metadata without source lines.
+    for mut data in indexer.files.iter_mut() {
+        std::sync::Arc::make_mut(data.value_mut()).lines = Default::default();
+    }
+    indexer.index_content(&Url::parse("file:///workspace/Wrong.java").unwrap(),
+        "package unrelated;\npublic class Builder {\n    public Wrong withTemplate(Object template) { return null; }\n}\n");
+    let caller_uri = Url::parse("file:///workspace/Test.kt").unwrap();
+    indexer.index_content(
+        &caller_uri,
+        "package client\nimport app.Provider\nfun test() {}\n",
+    );
+    for (receiver, method, expected) in [
+        (
+            "Provider.Configuration",
+            "builder",
+            "Provider.Configuration.Builder",
+        ),
+        ("Builder", "withTemplate", "Provider.Configuration.Builder"),
+        ("Builder", "usingDbTime", "Provider.Configuration.Builder"),
+    ] {
+        assert_eq!(
+            indexer
+                .method_return_type(receiver, method, Some(&caller_uri))
+                .map(|result| result.into_inner()),
+            Some(expected.to_owned()),
+            "{receiver}.{method}",
+        );
+    }
+    for expression in [
+        "Provider.Configuration.builder().withTemplate(null).",
+        "Provider.Configuration\n        .builder()\n        .withTemplate(null)\n        .usingDbTime()\n        .",
+        "builder.usingDbTime().",
+        "inferred.",
+    ] {
+        let source = format!("package client\nimport app.Provider\nfun test(builder: Provider.Configuration.Builder) {{\n    val inferred = Provider.Configuration.builder()\n    {expression}\n}}\n");
+        indexer.index_content(&caller_uri, &source);
+        indexer.store_live_tree(&caller_uri, &source);
+        let (line, text) = source.lines().enumerate().find(|(_, text)| text.ends_with('.')).unwrap();
+        let response = crate::features::completion::compute_completions(
+            &caller_uri,
+            tower_lsp::lsp_types::Position::new(line as u32, text.len() as u32),
+            false,
+            &indexer,
+        ).expect(expression);
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(items.iter().any(|item| item.label == "build"), "{expression}");
+        assert!(items.iter().any(|item| item.label == "usingDbTime"), "{expression}");
+    }
+}
+
+#[test]
+fn inherited_method_return_uses_resolved_ancestor_not_caller_import() {
+    use crate::indexer::Indexer;
+    use crate::resolver::Resolver;
+    use tower_lsp::lsp_types::Url;
+
+    let indexer = Indexer::new();
+    for (path, source) in [
+        (
+            "a/Base.kt",
+            "package a\nopen class Base { fun value(): String = \"\" }",
+        ),
+        (
+            "b/Base.kt",
+            "package b\nopen class Base { fun value(): Int = 0 }",
+        ),
+        (
+            "app/Derived.kt",
+            "package app\nimport a.Base\nclass Derived : Base()",
+        ),
+        (
+            "app/Caller.kt",
+            "package app\nimport b.Base\nfun caller() {}",
+        ),
+    ] {
+        indexer.index_content(&Url::parse(&format!("file:///{path}")).unwrap(), source);
+    }
+    let caller_uri = Url::parse("file:///app/Caller.kt").unwrap();
+    assert_eq!(
+        indexer
+            .method_return_type("Derived", "value", Some(&caller_uri))
+            .map(|result| result.into_inner()),
+        Some("String".to_owned()),
+    );
+}
+
+#[test]
+fn java_inherited_builder_return_infers_local() {
+    use crate::indexer::Indexer;
+    use tower_lsp::lsp_types::Url;
+
+    let indexer = Indexer::new();
+    let java_uri = Url::parse("file:///app/Builder.java").unwrap();
+    indexer.index_content(&java_uri, "package app;\npublic class Builder extends Base<Builder> {\n    public Configuration build() { return null; }\n}\n");
+    let base_uri = Url::parse("file:///app/Base.java").unwrap();
+    indexer.index_content(
+        &base_uri,
+        "package app;\npublic class Base<T> {\n    public T usingDbTime() { return null; }\n}\n",
+    );
+    let kotlin_uri = Url::parse("file:///app/Test.kt").unwrap();
+    let source = "package app\nfun test(builder: Builder) {\n    val inferred = builder.usingDbTime()\n    inferred.\n}\n";
+    indexer.index_content(&kotlin_uri, source);
+    indexer.store_live_tree(&kotlin_uri, source);
+    assert_eq!(
+        super::infer_variable_type_raw(&indexer, "inferred", &kotlin_uri),
+        Some("Builder".to_owned()),
+    );
+    let response = crate::features::completion::compute_completions(
+        &kotlin_uri,
+        tower_lsp::lsp_types::Position::new(3, 13),
+        false,
+        &indexer,
+    )
+    .expect("inferred Java builder should have completions");
+    let items = match response {
+        tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+        tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+    };
+    assert!(items.iter().any(|item| item.label == "build"));
+}
+
+#[test]
 fn return_type_simple() {
     assert_eq!(
         extract_return_type_from_detail("fun getDetail(req: Req): AccountDetail"),

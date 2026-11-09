@@ -5,6 +5,37 @@ use std::path::Path;
 
 use super::Config;
 
+#[test]
+fn manifest_suppresses_default_sources_but_preserves_explicit_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let default = crate::util::home_dir()
+        .map(|home| home.join(".kmp-lsp/sources").to_string_lossy().into_owned());
+    let baseline = config(root).resolve_sources();
+    if let Some(default) = &default {
+        assert_eq!(baseline.contains(default), Path::new(default).is_dir());
+    }
+    // Missing manifests must suppress defaults too, not leak unrelated sources.
+    fs::write(
+        root.join("workspace.json"),
+        r#"{"dependencyManifest":"missing.json"}"#,
+    )
+    .unwrap();
+    let scoped = config_with_explicit(root, &["/explicit/jdk"]).resolve_sources();
+    if let Some(default) = &default {
+        assert!(!scoped.contains(default));
+    }
+    assert!(scoped.contains(&"/explicit/jdk".to_string()));
+    fs::write(
+        root.join("workspace.json"),
+        r#"{"dependencyManifest":"missing.json","sourcePaths":["/configured/jdk"]}"#,
+    )
+    .unwrap();
+    assert!(config(root)
+        .resolve_sources()
+        .contains(&"/configured/jdk".to_string()));
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn config(root: &Path) -> Config {

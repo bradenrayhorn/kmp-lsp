@@ -339,19 +339,33 @@ pub(crate) fn index_sources_jars(
     cache_dir: Option<&Path>,
 ) -> usize {
     let sources = scan_gradle_sources_jars(gradle_home);
+    index_sources_jar_paths(indexer, &sources, cache_dir)
+}
+
+/// Index only these source JARs through the existing extraction/parse cache.
+/// Cache entries for other projects are never applied.
+pub(crate) fn index_sources_jar_paths(
+    indexer: &crate::indexer::Indexer,
+    sources: &[PathBuf],
+    cache_dir: Option<&Path>,
+) -> usize {
     if sources.is_empty() {
-        log::debug!("jar: no sources JARs found in Gradle cache");
+        remove_deselected_source_files(indexer, &std::collections::HashSet::new());
         return 0;
     }
-
     let mut cache = super::sources_jar_cache::load_sources_jar_cache(cache_dir);
     let pruned = super::sources_jar_cache::prune_deleted_jars(&mut cache);
 
-    let (cache_hits, mut contributions, missed) = partition_sources_jars(&cache, &sources);
+    let (cache_hits, mut contributions, missed) = partition_sources_jars(&cache, sources);
     let cache_dirty = pruned || !missed.is_empty();
 
     contributions.extend(parse_missed_sources_jars(&mut cache, missed));
     let total_files = contributions.len();
+    let selected_uris: std::collections::HashSet<&str> = contributions
+        .iter()
+        .map(|contribution| contribution.file_data.0.as_str())
+        .collect();
+    remove_deselected_source_files(indexer, &selected_uris);
 
     let total_symbols = apply_sources_contributions(indexer, contributions);
 
@@ -369,6 +383,23 @@ pub(crate) fn index_sources_jars(
     }
 
     total_symbols
+}
+
+fn remove_deselected_source_files(
+    indexer: &crate::indexer::Indexer,
+    selected_uris: &std::collections::HashSet<&str>,
+) {
+    let removed: Vec<Url> = indexer
+        .library_uris
+        .iter()
+        .filter(|uri| {
+            uri.starts_with("jar:")
+                && indexer.files.contains_key(uri.as_str())
+                && !selected_uris.contains(uri.as_str())
+        })
+        .filter_map(|uri| Url::parse(uri.as_str()).ok())
+        .collect();
+    indexer.remove_source_files(&removed);
 }
 
 /// Split sources JARs into cache hits (returning ready-to-apply contributions
@@ -636,6 +667,30 @@ pub(crate) fn apply_sources_contributions(
     indexer: &crate::indexer::Indexer,
     contributions: Vec<FileContributions>,
 ) -> usize {
+    let extracted_sources: std::collections::HashSet<_> = indexer
+        .files
+        .iter()
+        .filter(|entry| entry.key().starts_with("file:") && entry.source_set == SourceSet::Library)
+        .filter_map(|entry| {
+            indexer
+                .content_hashes
+                .get(entry.key())
+                .map(|hash| (*hash, entry.package.clone()))
+        })
+        .collect();
+    // Extracted library files and their sources-JAR copies describe the same
+    // declarations. Registering both makes ambiguity-safe hierarchy lookup
+    // reject a unique ancestor as two competing definitions.
+    let contributions: Vec<_> = contributions
+        .into_iter()
+        .filter(|contribution| {
+            contribution.file_data.0.starts_with("file:")
+                || !extracted_sources.contains(&(
+                    contribution.content_hash.1,
+                    contribution.file_data.1.package.clone(),
+                ))
+        })
+        .collect();
     if contributions.is_empty() {
         return 0;
     }
@@ -925,6 +980,25 @@ pub(crate) fn extension_receiver_key(receiver_type: &str) -> String {
         .to_owned()
 }
 
+fn parsed_type_exists(indexer: &crate::indexer::Indexer, symbol: &SidecarSymbol) -> bool {
+    if !matches!(symbol.kind.as_str(), "class" | "interface" | "object") {
+        return false;
+    }
+    let key = format!("{}.{}", symbol.pkg, symbol.name);
+    let existing = indexer.qualified.get(&key).map(|entry| *entry.value());
+    let Some(location) = existing.and_then(|location| indexer.file_table.location(location)) else {
+        return false;
+    };
+    let Some(file_data) = indexer.files.get(location.uri.as_str()) else {
+        return false;
+    };
+    file_data.symbols.iter().any(|parsed| {
+        parsed.selection_range == location.range
+            && parsed.kind == kind_str_to_lsp(&symbol.kind)
+            && parsed.container.as_deref().unwrap_or("") == symbol.container
+    })
+}
+
 /// Build `FileData` + definition entries for one JAR and insert them into the index.
 fn build_jar_file_data(
     indexer: &crate::indexer::Indexer,
@@ -987,15 +1061,17 @@ fn build_jar_file_data(
             trailing_lambda: sym.trailing_lambda,
             deprecated: sym.deprecated,
         });
-        indexer
-            .jar_definitions
-            .entry(sym.name.clone())
-            .or_default()
-            .push(tower_lsp::lsp_types::Location {
-                uri: fake_uri.clone(),
-                range: synthetic_range,
-            });
-        jar_names.push(sym.name.clone());
+        if !parsed_type_exists(indexer, sym) {
+            indexer
+                .jar_definitions
+                .entry(sym.name.clone())
+                .or_default()
+                .push(tower_lsp::lsp_types::Location {
+                    uri: fake_uri.clone(),
+                    range: synthetic_range,
+                });
+            jar_names.push(sym.name.clone());
+        }
         for super_name in &sym.supers {
             supers.push((line_idx as u32, super_name.clone(), Vec::new()));
         }

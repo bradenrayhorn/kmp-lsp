@@ -235,6 +235,25 @@ Library sources are resolved automatically — no manual config needed in most c
 
 When `sourcePaths` is present (even as `[]`), it overrides the `~/.kmp-lsp/sources` default. Use `[]` to disable all library sources for a specific project.
 
+**`dependencyManifest`** — opt into project-scoped dependencies instead of crawling the shared Gradle cache:
+
+```json
+{ "dependencyManifest": ".kmp-lsp/dependencies.json" }
+```
+
+The referenced JSON must contain both lists:
+
+```json
+{
+  "compiledJars": ["/absolute/path/library-1.0.jar"],
+  "sourceJars": ["/absolute/path/library-1.0-sources.jar"]
+}
+```
+
+These exact lists replace **both** compiled and source JAR cache discovery, without highest-version selection or classifier/platform filtering. Empty lists are honored. Manifest and artifact paths may be absolute or relative to the workspace root (not the manifest directory); `<WORKSPACE>` is supported. Missing/unreadable/malformed manifests or missing artifact files warn and disable shared dependency discovery, never silently fall back. Without the setting, existing discovery is unchanged for valid `workspace.json` files. An unreadable or malformed `workspace.json` also disables shared dependency discovery: the server cannot safely determine whether it specifies a manifest. Reindexing removes deselected source-JAR symbols. CLI indexing honors manifest sources too (`--no-stdlib` skips them); a configured manifest suppresses the global extracted-sources fallback unless `sourcePaths` explicitly opts into it.
+
+Explicit `jarPaths` remain additive. Manifest mode suppresses the default `~/.kmp-lsp/sources` library directory; explicitly configured `sourcePaths` (including JDK sources) and LSP source paths remain honored. Android SDK sources, SDK `android.jar`, and project-generated `R.jar` retain their existing discovery/gating semantics.
+
 **`jarPaths`** — for projects **without a Gradle cache** (Make/Bazel/manual builds), where the automatic `~/.gradle/caches` scan finds nothing, point the indexer directly at your compiled dependency jars. Entries may be `.jar`/`.aar` files **or directories** (recursively expanded); `<WORKSPACE>` and relative paths resolve against the project root. These are indexed *in addition to* anything found in the Gradle cache.
 
 ```json

@@ -64,6 +64,71 @@ fn store_in_cache_rejects_stale_write_racing_a_concurrent_reindex() {
     );
 }
 
+#[tokio::test]
+async fn completes_multiline_java_library_builder_chains() {
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+    let library = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        library.path().join("Provider.java"),
+        r#"package app;
+import app.SqlConfiguration.SqlConfigurationBuilder;
+public class Provider {
+    public static final class Configuration extends SqlConfiguration {
+        public static Configuration.Builder builder() { return new Builder(); }
+        public static final class Builder extends SqlConfigurationBuilder<Builder> {
+            public Builder withTemplate(Object template) { return this; }
+            public Configuration build() { return null; }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        library.path().join("SqlConfiguration.java"),
+        r#"package app;
+public class SqlConfiguration {
+    public abstract static class SqlConfigurationBuilder<T extends SqlConfigurationBuilder<T>> {
+        public T usingDbTime() { return null; }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let indexer = Arc::new(Indexer::new());
+    *indexer.source_paths_raw.write().unwrap() =
+        vec![library.path().to_str().unwrap().to_owned()];
+    Arc::clone(&indexer)
+        .index_source_paths(workspace.path().to_owned())
+        .await;
+    let uri = Url::from_file_path(workspace.path().join("Example.kt")).unwrap();
+
+    for tail in [".", ".u", ".usingDbTime().", ".usingDbTime().b"] {
+        let source = format!(
+            "package example\nimport app.Provider\nfun example() =\n    Provider.Configuration\n        .builder()\n        .withTemplate(Any())\n        {tail}\n"
+        );
+        indexer.index_content(&uri, &source);
+        indexer.store_live_tree(&uri, &source);
+        let position = Position::new(6, 8 + tail.len() as u32);
+        let response = super::compute_completions(&uri, position, true, indexer.as_ref())
+            .expect("Java builder chain should offer completions");
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        for expected in ["build", "usingDbTime", "withTemplate"] {
+            assert!(
+                items.iter().any(|item| item.label == expected),
+                "missing {expected} after {tail}: {items:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn split_prefix_after_dot() {
     let (prefix, before_prefix) = split_prefix("foo.bar");

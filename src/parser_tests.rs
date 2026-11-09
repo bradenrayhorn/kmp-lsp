@@ -453,6 +453,24 @@ fn dot_completion_hides_private() {
 }
 
 #[test]
+fn java_superclass_arguments_preserve_nested_generics() {
+    let data = parse_java(
+        "class Derived extends app.Base<Map<String, List<Value>>, Derived> {}\nclass Plain extends Base {}",
+    );
+    assert_eq!(
+        data.supers,
+        vec![
+            (1, "Base".to_owned(), vec![]),
+            (
+                0,
+                "app.Base".to_owned(),
+                vec!["Map<String, List<Value>>".to_owned(), "Derived".to_owned()],
+            ),
+        ],
+    );
+}
+
+#[test]
 fn java_package_extracted() {
     let data = parse_java("package cz.moneta.example;\npublic class Foo {}");
     assert_eq!(data.package.as_deref(), Some("cz.moneta.example"));

@@ -259,6 +259,106 @@ fn on_demand_materialization_must_not_clobber_parsed_qualified_entries() {
 }
 
 #[test]
+fn java_builder_hierarchy_survives_jar_indexing() {
+    use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+    let indexer = idx();
+    let provider = r#"package app;
+import sql.SqlConfiguration;
+public class Provider {
+    public static final class Configuration extends SqlConfiguration {
+        public static Configuration.Builder builder() { return new Builder(); }
+        public static final class Builder extends SqlConfigurationBuilder<Builder> {
+            public Builder withTemplate(Object template) { return this; }
+            public Configuration build() { return null; }
+        }
+    }
+}
+"#;
+    let configuration = r#"package sql;
+public class SqlConfiguration {
+    public abstract static class SqlConfigurationBuilder<T extends SqlConfigurationBuilder<T>> {
+        public T usingDatabaseTime() { return null; }
+    }
+}
+"#;
+    for (name, content) in [("Provider", provider), ("SqlConfiguration", configuration)] {
+        let source_uri = Url::parse(&format!("file:///sources/{name}.java")).unwrap();
+        indexer.index_content(&source_uri, content);
+        let mut data = indexer.files.get_mut(source_uri.as_str()).unwrap();
+        std::sync::Arc::make_mut(data.value_mut()).source_set = SourceSet::Library;
+    }
+    indexer.index_content(&Url::parse("file:///other/Other.java").unwrap(), "package other; public class Other { public static class Builder { public void unrelated() {} } }");
+    let user_uri = Url::parse("file:///workspace/Example.kt").unwrap();
+    for phase in 0..3 {
+        if phase == 1 {
+            let mut compiled = vec![
+                make_sidecar_symbol("Provider", "class", "class Provider", ""),
+                make_sidecar_symbol("Configuration", "class", "class Configuration", "Provider"),
+                make_sidecar_symbol("Builder", "class", "class Builder", "Configuration"),
+            ];
+            compiled.extend([
+                make_sidecar_symbol("SqlConfiguration", "class", "class SqlConfiguration", ""),
+                make_sidecar_symbol(
+                    "SqlConfigurationBuilder",
+                    "class",
+                    "class SqlConfigurationBuilder",
+                    "SqlConfiguration",
+                ),
+                make_sidecar_symbol(
+                    "usingDatabaseTime",
+                    "fun",
+                    "fun usingDatabaseTime()",
+                    "SqlConfigurationBuilder",
+                ),
+            ]);
+            for (position, symbol) in compiled.iter_mut().enumerate() {
+                symbol.pkg = if position < 3 { "app" } else { "sql" }.to_owned();
+            }
+            compiled[2].supers = vec!["SqlConfiguration$SqlConfigurationBuilder".to_owned()];
+            populate_from_symbols(&indexer, "/lib/provider.jar".as_ref(), &compiled);
+        }
+        if phase == 2 {
+            super::jar::index_jar_entries(
+                &indexer,
+                vec![
+                    (
+                        Url::parse("jar:file:///lib/provider-sources.jar!/app/Provider.java")
+                            .unwrap(),
+                        provider.to_owned(),
+                    ),
+                    (
+                        Url::parse("jar:file:///lib/sql-sources.jar!/app/SqlConfiguration.java")
+                            .unwrap(),
+                        configuration.to_owned(),
+                    ),
+                ],
+            );
+        }
+        for tail in [".", ".usingDatabaseTime()."] {
+            let source = format!("package example\nimport app.Provider\nfun example() = Provider.Configuration.builder().withTemplate(Any()){tail}\n");
+            indexer.index_content(&user_uri, &source);
+            indexer.store_live_tree(&user_uri, &source);
+            let position = Position::new(2, source.lines().nth(2).unwrap().len() as u32);
+            let response = crate::features::completion::compute_completions(
+                &user_uri, position, true, &indexer,
+            )
+            .unwrap();
+            let items = match response {
+                CompletionResponse::Array(items) => items,
+                CompletionResponse::List(list) => list.items,
+            };
+            for expected in ["build", "withTemplate", "usingDatabaseTime"] {
+                assert!(
+                    items.iter().any(|item| item.label == expected),
+                    "phase {phase}, tail {tail}, missing {expected}: {items:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn jar_symbol_resolves_via_import() {
     let indexer = idx();
     let jar_path = "/home/test/.gradle/caches/coroutines-core-1.7.3.jar";
@@ -805,6 +905,173 @@ fn write_sources_jar(
     }
     writer.finish().unwrap();
     jar_path
+}
+
+#[test]
+fn explicit_sources_paths_exclude_other_cached_dependencies() {
+    let gradle = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let older = write_sources_jar(
+        gradle.path(),
+        "project",
+        "library",
+        "1",
+        &[("project/Old.kt", "package project\nclass Old")],
+    );
+    write_sources_jar(
+        gradle.path(),
+        "project",
+        "library",
+        "2",
+        &[("project/New.kt", "package project\nclass New")],
+    );
+    write_sources_jar(
+        gradle.path(),
+        "unrelated",
+        "other",
+        "1",
+        &[("unrelated/Other.kt", "package unrelated\nclass Other")],
+    );
+    // Populate the shared parse cache with the newer and unrelated dependencies.
+    let global = crate::indexer::Indexer::new();
+    crate::indexer::jar::index_sources_jars(&global, Some(gradle.path()), Some(cache.path()));
+    assert!(global.qualified.contains_key("project.New"));
+    assert!(global.qualified.contains_key("unrelated.Other"));
+    for _ in 0..2 {
+        let scoped = crate::indexer::Indexer::new();
+        crate::indexer::jar::index_sources_jar_paths(
+            &scoped,
+            std::slice::from_ref(&older),
+            Some(cache.path()),
+        );
+        assert!(scoped.qualified.contains_key("project.Old"));
+        assert!(!scoped.qualified.contains_key("project.New"));
+        assert!(!scoped.qualified.contains_key("unrelated.Other"));
+    }
+    let empty = crate::indexer::Indexer::new();
+    assert_eq!(
+        crate::indexer::jar::index_sources_jar_paths(&empty, &[], Some(cache.path())),
+        0
+    );
+    assert!(empty.qualified.is_empty());
+}
+
+#[test]
+fn selected_sources_shrink_after_reindex_then_empty() {
+    let gradle = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let kept = write_sources_jar(
+        gradle.path(),
+        "project",
+        "kept",
+        "1",
+        &[("Kept.kt", "package project\nclass Kept")],
+    );
+    let removed = write_sources_jar(
+        gradle.path(),
+        "project",
+        "removed",
+        "1",
+        &[(
+            "Removed.kt",
+            "package project\nclass Removed : Kept()\nfun Kept.removedExtension() {}",
+        )],
+    );
+    let indexer = crate::indexer::Indexer::new();
+    let external = Url::from_file_path(gradle.path().join("External.kt")).unwrap();
+    indexer.index_content(&external, "package external\nclass External");
+    indexer.library_uris.insert(external.to_string());
+    let compiled = indexer.jar_table.intern("/compiled.jar");
+    indexer
+        .jar_qualified
+        .insert("compiled.Preserved".into(), compiled);
+    populate_from_symbols(
+        &indexer,
+        std::path::Path::new("/compiled.jar"),
+        &[make_sidecar_symbol(
+            "Preserved",
+            "class",
+            "class Preserved",
+            "",
+        )],
+    );
+    let compiled_uri = "jar:file:///compiled.jar";
+    assert!(indexer.library_uris.contains(compiled_uri));
+    crate::indexer::jar::index_sources_jar_paths(
+        &indexer,
+        &[kept.clone(), removed],
+        Some(cache.path()),
+    );
+    assert!(indexer.qualified.contains_key("project.Removed"));
+    assert!(indexer.library_uris.contains(compiled_uri));
+    indexer.reset_index_state();
+    crate::indexer::jar::index_sources_jar_paths(&indexer, &[kept], Some(cache.path()));
+    assert!(indexer.qualified.contains_key("project.Kept"));
+    assert!(!indexer.qualified.contains_key("project.Removed"));
+    assert!(indexer.definition_locations("Removed").is_empty());
+    assert!(!indexer.subtypes.contains_key("Kept"));
+    assert!(!indexer.extension_by_receiver.contains_key("Kept"));
+    assert!(!indexer
+        .files
+        .iter()
+        .any(|entry| entry.key().contains("Removed.kt")));
+    assert!(!indexer
+        .content_hashes
+        .iter()
+        .any(|entry| entry.key().contains("Removed.kt")));
+    indexer.reset_index_state();
+    crate::indexer::jar::index_sources_jar_paths(&indexer, &[], Some(cache.path()));
+    assert!(!indexer.qualified.contains_key("project.Kept"));
+    assert!(!indexer.packages.contains_key("project"));
+    assert!(indexer.files.contains_key(external.as_str()));
+    assert!(indexer.qualified.contains_key("external.External"));
+    assert!(indexer.jar_qualified.contains_key("compiled.Preserved"));
+    assert!(indexer.jar_files.contains_key(compiled_uri));
+    assert!(!indexer
+        .library_uris
+        .iter()
+        .any(|uri| uri.starts_with("jar:") && uri.contains("!/")));
+
+    let selected = write_sources_jar(
+        gradle.path(),
+        "project",
+        "selected",
+        "1",
+        &[("Selected.kt", "package project\nclass Selected")],
+    );
+    crate::indexer::jar::index_sources_jar_paths(&indexer, &[selected], Some(cache.path()));
+    std::fs::write(
+        gradle.path().join("workspace.json"),
+        r#"{"dependencyManifest":"invalid.json"}"#,
+    )
+    .unwrap();
+    std::fs::write(gradle.path().join("invalid.json"), "malformed").unwrap();
+    indexer.reset_index_state();
+    let invalid = crate::workspace_json::load_dependency_manifest(gradle.path()).unwrap();
+    crate::indexer::jar::index_sources_jar_paths(
+        &indexer,
+        &invalid.source_jars,
+        Some(cache.path()),
+    );
+    assert!(indexer.definition_locations("Selected").is_empty());
+    assert!(!indexer.qualified.contains_key("project.Selected"));
+    assert!(indexer.jar_qualified.contains_key("compiled.Preserved"));
+}
+
+#[test]
+fn source_removal_preserves_competing_qualified_location() {
+    let indexer = crate::indexer::Indexer::new();
+    let removed = Url::parse("jar:file:///removed-sources.jar!/Shared.kt").unwrap();
+    let kept = Url::parse("file:///kept/Shared.kt").unwrap();
+    indexer.index_content(&removed, "package competing\nclass Shared");
+    indexer.index_content(&kept, "package competing\nclass Shared");
+    indexer.remove_source_files(&[removed]);
+    let location = indexer.qualified.get("competing.Shared").unwrap();
+    assert_eq!(
+        indexer.file_table.url(location.file).as_deref(),
+        Some(&kept)
+    );
+    assert_eq!(indexer.definition_locations("Shared").len(), 1);
 }
 
 #[test]

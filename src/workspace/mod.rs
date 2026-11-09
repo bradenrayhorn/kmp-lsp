@@ -117,8 +117,8 @@ impl Config {
             for p in configured_paths {
                 push(p.to_string_lossy().into_owned());
             }
-        } else {
-            // No explicit `sourcePaths` key — fall back to the well-known
+        } else if crate::workspace_json::load_dependency_manifest(&self.root).is_none() {
+            // No manifest or explicit `sourcePaths` — fall back to the well-known
             // `extract-sources` output directory if it exists.
             if let Some(home) = crate::util::home_dir() {
                 let default_sources = home.join(".kmp-lsp").join("sources");

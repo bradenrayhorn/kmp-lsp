@@ -2391,8 +2391,11 @@ impl crate::types::FileData {
             for child in node.children(&mut cur) {
                 if child.kind() == KIND_SUPERCLASS {
                     if let Some(name) = child.java_first_type_name(bytes) {
-                        self.supers
-                            .push((name_line, name, child.type_arg_strings(bytes)));
+                        let type_args = child
+                            .first_child_of_kind("generic_type")
+                            .map(|generic| generic.type_arg_strings(bytes))
+                            .unwrap_or_default();
+                        self.supers.push((name_line, name, type_args));
                     }
                 } else if child.kind() == KIND_SUPER_INTERFACES {
                     for (name, type_args) in child.java_type_list(bytes) {

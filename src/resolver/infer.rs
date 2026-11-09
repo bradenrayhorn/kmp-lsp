@@ -1245,10 +1245,56 @@ fn reachable_class_candidates(
         .map(|uri| super::resolve::resolve_type_index_only(indexer, class_base, uri))
         .unwrap_or_default();
     if candidates.is_empty() {
-        candidates = indexer.workspace_def_candidates(class_base);
+        if let Some(uri) = from_uri {
+            candidates = imported_nested_class_candidates(indexer, class_base, uri);
+        }
     }
     if candidates.is_empty() {
-        candidates = indexer.lookup_definitions(class_base);
+        candidates = indexer.workspace_def_candidates(class_base.last_segment());
+    }
+    if candidates.is_empty() {
+        candidates = indexer.lookup_definitions(class_base.last_segment());
+    }
+    candidates
+}
+
+fn imported_nested_class_candidates(
+    indexer: &Indexer,
+    type_name: &str,
+    from_uri: &Url,
+) -> Vec<Location> {
+    let Some(caller) = ensure_file_data(indexer, from_uri) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for import in caller.imports.iter().filter(|import| !import.is_star) {
+        for outer in super::resolve::resolve_type_index_only(indexer, &import.local_name, from_uri)
+        {
+            let Some(data) = ensure_file_data(indexer, &outer.uri) else {
+                continue;
+            };
+            for symbol in data.symbols.iter().filter(|symbol| {
+                symbol.name == type_name.last_segment()
+                    && matches!(symbol.kind, SymbolKind::CLASS | SymbolKind::INTERFACE)
+            }) {
+                let mut container = symbol.container.as_deref();
+                for _ in 0..MAX_RAW_TYPE_INFER_DEPTH {
+                    let Some(name) = container else { break };
+                    if name == import.full_path.last_segment() {
+                        candidates.push(Location::new(outer.uri.clone(), symbol.selection_range));
+                        break;
+                    }
+                    container = data
+                        .symbols
+                        .iter()
+                        .find(|parent| {
+                            parent.name == name
+                                && matches!(parent.kind, SymbolKind::CLASS | SymbolKind::INTERFACE)
+                        })
+                        .and_then(|parent| parent.container.as_deref());
+                }
+            }
+        }
     }
     candidates
 }
@@ -1749,35 +1795,95 @@ pub(crate) fn find_method_return_type(
         return Some(ret);
     }
 
-    // Then check member functions (container-based), scoped + capped via the helper.
-    indexer.find_in_workspace_defs(type_base, |loc| {
-        let file_data = indexer.files.get(loc.uri.as_str())?;
-        for symbol in &file_data.symbols {
-            if symbol.name != method_name {
-                continue;
+    // Configured source libraries are excluded from workspace-only lookups.
+    reachable_class_candidates(indexer, type_name, from_uri)
+        .iter()
+        .take(crate::indexer::MAX_BY_NAME_DEFS)
+        .find_map(|loc| find_member_method_return_type(indexer, type_base, method_name, &loc.uri))
+}
+
+fn find_member_method_return_type(
+    indexer: &Indexer,
+    type_base: &str,
+    method_name: &str,
+    class_uri: &Url,
+) -> Option<String> {
+    let file_data = ensure_file_data(indexer, class_uri)?;
+    for symbol in &file_data.symbols {
+        if symbol.name != method_name {
+            continue;
+        }
+        if !matches!(
+            symbol.kind,
+            SymbolKind::FUNCTION | SymbolKind::METHOD | SymbolKind::OPERATOR
+        ) {
+            continue;
+        }
+        if symbol.container.as_deref() != Some(type_base) {
+            continue;
+        }
+        // Try detail first; fall back to source lines when detail is truncated.
+        if let Some(ret) = extract_return_type_from_detail(&symbol.detail).or_else(|| {
+            if class_uri.path().ends_with(".java") {
+                crate::rg::declared_type_from_detail(&symbol.detail, symbol.kind)
+            } else {
+                None
             }
-            if !matches!(
-                symbol.kind,
-                SymbolKind::FUNCTION | SymbolKind::METHOD | SymbolKind::OPERATOR
-            ) {
-                continue;
-            }
-            if symbol.container.as_deref() != Some(type_base) {
-                continue;
-            }
-            // Try detail first; fall back to source lines when detail is truncated.
-            if let Some(ret) = extract_return_type_from_detail(&symbol.detail) {
-                return Some(ret);
-            }
-            // detail may be truncated (120 char limit) — try the source lines.
-            let start_line = symbol.selection_start() as usize;
-            let full_sig = file_data.lines.collect_signature(start_line);
-            if let Some(ret) = extract_return_type_from_detail(&full_sig) {
-                return Some(ret);
+        }) {
+            return Some(qualify_source_jar_return_type(&file_data, class_uri, ret));
+        }
+        if class_uri.path().ends_with(".java") {
+            if let Some(ret) =
+                crate::rg::declared_type_from_raw_lines(&file_data.lines, symbol.range, symbol.kind)
+            {
+                return Some(qualify_source_jar_return_type(&file_data, class_uri, ret));
             }
         }
-        None
-    })
+        // detail may be truncated (120 char limit) — try the source lines.
+        let start_line = symbol.selection_start() as usize;
+        let full_sig = file_data.lines.collect_signature(start_line);
+        if let Some(ret) = extract_return_type_from_detail(&full_sig) {
+            return Some(ret);
+        }
+    }
+    None
+}
+
+pub(crate) fn qualify_source_jar_return_type(data: &FileData, uri: &Url, raw: String) -> String {
+    if uri.scheme() != "jar" || !uri.path().ends_with(".java") {
+        return raw;
+    }
+    let base = raw.dotted_ident_prefix();
+    let mut matching = data.symbols.iter().filter(|symbol| {
+        symbol.name == base.last_segment()
+            && matches!(symbol.kind, SymbolKind::CLASS | SymbolKind::INTERFACE)
+    });
+    let Some(symbol) = matching.next() else {
+        return raw;
+    };
+    if matching.next().is_some() {
+        return raw;
+    }
+    let mut parts = vec![symbol.name.as_str()];
+    let mut container = symbol.container.as_deref();
+    for _ in 0..MAX_RAW_TYPE_INFER_DEPTH {
+        let Some(name) = container else { break };
+        parts.push(name);
+        container = data
+            .symbols
+            .iter()
+            .find(|parent| {
+                parent.name == name
+                    && matches!(parent.kind, SymbolKind::CLASS | SymbolKind::INTERFACE)
+            })
+            .and_then(|parent| parent.container.as_deref());
+    }
+    parts.reverse();
+    let qualified = parts.join(".");
+    if base.contains('.') && !qualified.ends_with(&format!(".{base}")) && qualified != base {
+        return raw;
+    }
+    format!("{qualified}{}", &raw[base.len()..])
 }
 
 /// Returns true when an extension function declared in `entry_package` is
@@ -2088,7 +2194,7 @@ pub(crate) fn find_method_return_type_via_supertypes(
     // matched against bare symbol names below.
     let class_base = class_name.dotted_ident_prefix().last_segment().to_owned();
 
-    reachable_class_candidates(indexer, &class_base, from_uri)
+    reachable_class_candidates(indexer, class_name, from_uri)
         .into_iter()
         .take(crate::indexer::MAX_BY_NAME_DEFS)
         .find_map(|loc| {
@@ -2134,21 +2240,25 @@ fn find_method_return_type_via_class_hierarchy(
         caller,
         8,
         MAX_SYNC_JAR_PROMOTIONS_PER_HIERARCHY_WALK,
-        |idx, super_name, _super_uri, _caller| {
-            find_method_return_type(idx, super_name, method_name, from_uri)
+        |idx, super_name, super_uri, _caller| {
+            let Ok(super_uri) = Url::parse(super_uri) else {
+                return Vec::new();
+            };
+            find_extension_fn_return_type(idx, super_name, method_name, from_uri)
+                .or_else(|| {
+                    find_member_method_return_type(idx, super_name, method_name, &super_uri)
+                })
                 .map(|raw| (super_name.to_owned(), raw))
                 .into_iter()
                 .collect()
         },
     );
     let (super_name, raw) = hits.into_iter().next()?;
-    Some(substitute_direct_supertype_args(
-        indexer,
-        class_uri,
-        class_base,
-        &super_name,
-        &raw,
-    ))
+    let substituted =
+        substitute_direct_supertype_args(indexer, class_uri, class_base, &super_name, &raw);
+    let uri = Url::parse(class_uri).ok()?;
+    let data = ensure_file_data(indexer, &uri)?;
+    Some(qualify_source_jar_return_type(&data, &uri, substituted))
 }
 
 /// If `super_name` is `class_base`'s *direct* supertype (declared with
@@ -2186,17 +2296,19 @@ fn substitute_direct_supertype_args(
     // -- see `supertype_targets` in hierarchy.rs), but `find_class_type_params`
     // matches against `FileData.symbols`' bare `name` field, so a qualified
     // spelling would silently miss and skip substitution entirely.
-    let super_type_params = find_class_type_params(indexer, super_name.last_segment());
+    let super_type_params = find_class_type_params(indexer, super_name.last_segment(), &uri);
     if super_type_params.is_empty() {
         return raw.to_owned();
     }
     apply_supertype_subst(raw, &super_type_params, type_args)
 }
 
-fn find_class_type_params(indexer: &Indexer, class_name: &str) -> Vec<String> {
-    indexer
-        .find_in_workspace_defs(class_name, |loc| {
-            let file_data = indexer.files.get(loc.uri.as_str())?;
+fn find_class_type_params(indexer: &Indexer, class_name: &str, from_uri: &Url) -> Vec<String> {
+    reachable_class_candidates(indexer, class_name, Some(from_uri))
+        .iter()
+        .take(crate::indexer::MAX_BY_NAME_DEFS)
+        .find_map(|location| {
+            let file_data = ensure_file_data(indexer, &location.uri)?;
             let symbol = file_data
                 .symbols
                 .iter()

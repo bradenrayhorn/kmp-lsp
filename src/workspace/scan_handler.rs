@@ -55,6 +55,7 @@ pub(crate) struct ScanHandler<R: ProgressReporter + 'static> {
     /// indexed alongside the Gradle cache. Set by `apply_config`; merged with
     /// `workspace.json`'s `jarPaths` in `spawn_jar_indexing`.
     configured_jar_paths: Mutex<Vec<String>>,
+    explicit_source_paths: Mutex<Vec<String>>,
 }
 
 impl<R: ProgressReporter + 'static> ScanHandler<R> {
@@ -74,6 +75,7 @@ impl<R: ProgressReporter + 'static> ScanHandler<R> {
             jar_done_tx,
             jar_indexing_in_progress: Arc::new(AtomicBool::new(false)),
             configured_jar_paths: Mutex::new(Vec::new()),
+            explicit_source_paths: Mutex::new(Vec::new()),
         }
     }
 
@@ -123,6 +125,14 @@ impl<R: ProgressReporter + 'static> ScanHandler<R> {
             log::warn!("Actor: Reindex received but no workspace root is set");
             return;
         };
+        let source_config = Config {
+            root: root.clone(),
+            explicit_source_paths: self.explicit_source_paths.lock().unwrap().clone(),
+            ignore_patterns: Vec::new(),
+            jar_paths: Vec::new(),
+            pin_workspace: true,
+        };
+        self.write_source_paths(source_config.resolve_sources());
         // Tier-1 (`jar_qualified`/`jar_bare_names`) and materialization
         // (`materialized`/`materialization_failed`) state must not survive a
         // reindex — a stale entry would point at a JarId whose manifest is
@@ -225,6 +235,7 @@ impl<R: ProgressReporter + 'static> ScanHandler<R> {
             .configured_jar_paths
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = config.jar_paths.clone();
+        *self.explicit_source_paths.lock().unwrap() = config.explicit_source_paths.clone();
         self.set_root(data.root.clone());
         self.apply_ignore_patterns(&config.ignore_patterns, &data.root);
         self.indexer
@@ -340,6 +351,7 @@ impl<R: ProgressReporter + 'static> ScanHandler<R> {
             }
 
             if reset_before_scan {
+                indexer.prune_source_path_libraries(&root);
                 indexer.reset_index_state();
             }
 
@@ -372,9 +384,16 @@ impl<R: ProgressReporter + 'static> ScanHandler<R> {
     fn spawn_jar_indexing(&self) {
         use crate::indexer::jar_phase::JarPhase;
 
-        // Cheap non-blocking check: skip if sidecar is unavailable.
+        // Source manifests still work without the compiled-JAR sidecar.
         match self.indexer.jar_sidecar.try_lock() {
-            Ok(guard) if guard.is_none() => return,
+            Ok(guard) if guard.is_none() => {
+                let manifest = self
+                    .current_root()
+                    .and_then(|root| crate::workspace_json::load_dependency_manifest(&root));
+                if manifest.is_none() {
+                    return;
+                }
+            }
             Err(_) => {
                 // Lock held by running scan — already in progress, coalesce.
                 return;
@@ -452,10 +471,12 @@ impl<R: ProgressReporter + 'static> ScanHandler<R> {
             // (real line numbers from tree-sitter) wins over the compiled-JAR entry
             // (synthetic line indices from the sidecar). Same Gradle gate as the
             // compiled pipeline — sources JARs come from the same cache.
-            let sources_total = if compiled.workspace_uses_gradle_cache {
+            let sources_total = if let Some(paths) = &compiled.manifest_source_paths {
+                crate::indexer::jar::index_sources_jar_paths(&indexer, paths, None)
+            } else if compiled.workspace_uses_gradle_cache {
                 crate::indexer::jar::index_sources_jars(&indexer, None, None)
             } else {
-                0
+                crate::indexer::jar::index_sources_jar_paths(&indexer, &[], None)
             };
 
             if compiled.paths.is_empty() && sources_total == 0 {
@@ -521,6 +542,7 @@ struct CompiledJarsOutcome {
     compiled_total: usize,
     sidecar_alive: bool,
     workspace_uses_gradle_cache: bool,
+    manifest_source_paths: Option<Vec<PathBuf>>,
 }
 
 /// Crawl the Gradle cache (sidecar path, populates `jar_files`/`jar_definitions`)
@@ -570,16 +592,29 @@ fn index_compiled_jars_phase(
         std::time::Duration::from_millis(100),
     )?;
 
-    let gradle_paths = if workspace_uses_gradle_cache {
-        crate::indexer::jar::scan_gradle_jars(None)
-    } else {
-        log::info!(
-            "jar: no Kotlin/Java sources in the workspace — skipping the \
+    let manifest = indexer
+        .workspace_root
+        .get()
+        .and_then(|root| crate::workspace_json::load_dependency_manifest(&root));
+    let manifest_source_paths = manifest
+        .as_ref()
+        .map(|manifest| manifest.source_jars.clone());
+    let gradle_paths = dependency_compiled_paths(manifest, || {
+        if workspace_uses_gradle_cache {
+            crate::indexer::jar::scan_gradle_jars(None)
+        } else {
+            log::info!(
+                "jar: no Kotlin/Java sources in the workspace — skipping the \
              Gradle-cache JAR pipeline (configured jarPaths still honored)"
-        );
-        Vec::new()
+            );
+            Vec::new()
+        }
+    });
+    let gradle_count = if manifest_source_paths.is_none() {
+        gradle_paths.len()
+    } else {
+        0
     };
-    let gradle_count = gradle_paths.len();
     let mut paths = compiled_jar_paths_with_android_sdk(
         indexer.workspace_root.get(),
         workspace_uses_gradle_cache,
@@ -631,7 +666,19 @@ fn index_compiled_jars_phase(
         compiled_total,
         sidecar_alive,
         workspace_uses_gradle_cache,
+        manifest_source_paths,
     })
+}
+
+/// Select exact manifest entries without executing the shared-cache crawl.
+fn dependency_compiled_paths(
+    manifest: Option<crate::workspace_json::DependencyManifest>,
+    crawl: impl FnOnce() -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    match manifest {
+        Some(manifest) => manifest.compiled_jars,
+        None => crawl(),
+    }
 }
 
 /// Clean up after a background JAR scan abandons because the workspace generation

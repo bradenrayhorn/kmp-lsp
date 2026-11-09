@@ -2,6 +2,66 @@ use super::*;
 use std::fs;
 use tempfile::TempDir;
 
+#[test]
+fn dependency_manifest_exact_paths_and_fail_closed() {
+    let directory = TempDir::new().unwrap();
+    let root = directory.path();
+    assert!(load_dependency_manifest(root).is_none());
+    make_workspace_json(&directory, r#"{"jarPaths":[]}"#);
+    assert!(load_dependency_manifest(root).is_none());
+    for name in [
+        "lib-1.jar",
+        "lib-2.jar",
+        "lib-1-jvm.jar",
+        "lib-1-sources.jar",
+    ] {
+        fs::write(root.join(name), "").unwrap();
+    }
+    let manifest_path = root.join("dependencies.json");
+    fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "compiledJars": ["lib-1.jar", root.join("lib-1-jvm.jar")],
+            "sourceJars": ["lib-1-sources.jar"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for setting in [
+        "dependencies.json".to_string(),
+        manifest_path.to_string_lossy().into_owned(),
+    ] {
+        make_workspace_json(
+            &directory,
+            &serde_json::json!({"dependencyManifest": setting}).to_string(),
+        );
+        let manifest = load_dependency_manifest(root).unwrap();
+        assert_eq!(
+            manifest.compiled_jars,
+            vec![root.join("lib-1.jar"), root.join("lib-1-jvm.jar")]
+        );
+        assert_eq!(manifest.source_jars, vec![root.join("lib-1-sources.jar")]);
+    }
+    for content in [
+        r#"{"compiledJars":[],"sourceJars":[]}"#,
+        "invalid",
+        r#"{"compiledJars":[]}"#,
+        r#"{"compiledJars":["missing.jar"],"sourceJars":[]}"#,
+    ] {
+        fs::write(&manifest_path, content).unwrap();
+        let manifest = load_dependency_manifest(root).unwrap();
+        assert!(manifest.compiled_jars.is_empty());
+        assert!(manifest.source_jars.is_empty());
+    }
+    fs::remove_file(manifest_path).unwrap();
+    assert!(load_dependency_manifest(root)
+        .unwrap()
+        .compiled_jars
+        .is_empty());
+    make_workspace_json(&directory, r#"{"dependencyManifest":42}"#);
+    assert!(load_dependency_manifest(root).is_some());
+}
+
 fn make_workspace_json(dir: &TempDir, json: &str) {
     fs::write(dir.path().join("workspace.json"), json).unwrap();
 }
@@ -21,6 +81,10 @@ fn malformed_json_returns_empty() {
     make_workspace_json(&dir, "{ not valid json }}}");
     let paths = load_source_paths(dir.path());
     assert!(paths.is_empty());
+    let manifest =
+        load_dependency_manifest(dir.path()).expect("unknown manifest setting fails closed");
+    assert!(manifest.compiled_jars.is_empty());
+    assert!(manifest.source_jars.is_empty());
 }
 
 #[test]

@@ -2,6 +2,105 @@ use super::*;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Url;
 
+#[test]
+fn completion_resolve_java_docs_from_cold_and_warm_source_paths() {
+    use crate::features::completion::resolve_completion_item;
+    use crate::indexer::test_helpers::with_xdg_cache;
+    use tower_lsp::lsp_types::{CompletionItem, Documentation};
+
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let library = directory.path().join("library");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let source_path = library.join("SqlConfiguration.java");
+    std::fs::write(
+        &source_path,
+        r#"package example;
+public class SqlConfiguration<T> {
+    /** Wrong neighboring documentation. */
+    public T withLockedByValue(String value) { return null; }
+
+    /**
+     * Uses the database clock with {@code UTC}.
+     * @return this builder
+     */
+    @Deprecated
+    public T usingDbTime() { return null; }
+
+    public T undocumented() { return null; }
+}
+"#,
+    )
+    .unwrap();
+    let source_uri = Url::from_file_path(&source_path).unwrap();
+    with_xdg_cache(&directory.path().join("cache"), || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for warm in [false, true] {
+            let index = Arc::new(crate::indexer::Indexer::new());
+            index.workspace_root.set(workspace.clone());
+            *index.source_paths_raw.write().unwrap() = vec![library.to_string_lossy().into_owned()];
+            runtime.block_on(Arc::clone(&index).index_source_paths(workspace.clone()));
+            let data = index.get_file_data(source_uri.as_str()).unwrap();
+            assert_eq!(
+                data.lines.is_empty(),
+                warm,
+                "must exercise warm stripped cache"
+            );
+            for name in ["usingDbTime", "undocumented"] {
+                let symbol = data
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.name == name)
+                    .unwrap();
+                assert!(symbol.doc().is_empty(), "must exercise source doc fallback");
+                let item = CompletionItem {
+                    label: name.into(),
+                    data: Some(serde_json::json!({
+                        "u": source_uri.as_str(),
+                        "l": symbol.selection_start(),
+                        "c": symbol.selection_range.start.character,
+                    })),
+                    ..Default::default()
+                };
+                let resolved = resolve_completion_item(item, &index);
+                if name == "undocumented" {
+                    assert!(resolved.documentation.is_none());
+                    continue;
+                }
+                assert!(resolved.detail.unwrap().contains("usingDbTime()"));
+                let Some(Documentation::MarkupContent(documentation)) = resolved.documentation
+                else {
+                    panic!("missing Java documentation (warm={warm})");
+                };
+                assert!(documentation.value.contains("database clock with `UTC`"));
+                assert!(documentation.value.contains("**Returns** this builder"));
+                assert!(!documentation.value.contains("Wrong neighboring"));
+                let hover = enrich_at_line(
+                    &index,
+                    source_uri.as_str(),
+                    symbol.selection_start(),
+                    symbol.selection_range.start.character,
+                    SubstitutionContext::None,
+                    &ResolveOptions::hover(),
+                )
+                .unwrap();
+                assert_eq!(hover.doc, documentation.value);
+                assert!(hover.deprecated);
+            }
+            // Resolving a doc must not repopulate stripped source or mutate the snapshot.
+            assert_eq!(
+                index
+                    .get_file_data(source_uri.as_str())
+                    .unwrap()
+                    .lines
+                    .is_empty(),
+                warm
+            );
+        }
+    });
+}
+
 // ── Minimal stub (for tests that don't need real data) ───────────────────
 
 struct TestIndex;

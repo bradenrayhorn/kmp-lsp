@@ -157,8 +157,25 @@ fn cache_exists(root: &Path) -> bool {
 /// 1. `workspace.json` (JetBrains IDE format) `sourcePaths` field at the workspace root
 /// 2. `~/.kmp-lsp/sources` — the default `extract-sources` output dir
 ///    (skipped when `no_stdlib` is true)
+/// 3. Manifest `sourceJars`, when configured (also skipped with `no_stdlib`)
 pub(crate) async fn build_index(root: &Path, no_stdlib: bool) -> Arc<Indexer> {
-    build_index_inner(root, collect_cli_source_paths(root, no_stdlib)).await
+    let indexer = build_index_inner(root, collect_cli_source_paths(root, no_stdlib)).await;
+    if !no_stdlib {
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if let Some(manifest) = crate::workspace_json::load_dependency_manifest(&canonical) {
+            let source_indexer = Arc::clone(&indexer);
+            tokio::task::spawn_blocking(move || {
+                crate::indexer::jar::index_sources_jar_paths(
+                    &source_indexer,
+                    &manifest.source_jars,
+                    None,
+                );
+            })
+            .await
+            .expect("manifest source indexing task failed");
+        }
+    }
+    indexer
 }
 
 async fn build_index_inner(root: &Path, source_paths: Vec<String>) -> Arc<Indexer> {
@@ -269,7 +286,7 @@ fn collect_cli_source_paths(root: &Path, no_stdlib: bool) -> Vec<String> {
                 }
             }
         }
-    } else if !no_stdlib {
+    } else if !no_stdlib && crate::workspace_json::load_dependency_manifest(root).is_none() {
         // Auto-include the well-known `extract-sources` output dir if present.
         if default_sources.is_dir() {
             let s = default_sources.to_string_lossy().into_owned();
@@ -505,6 +522,20 @@ fn compiled_jar_paths_for_cli(root: &Path, gradle_paths: Vec<PathBuf>) -> Vec<Pa
     )
 }
 
+fn dependency_jar_paths_for_cli(root: &Path) -> Vec<PathBuf> {
+    let dependencies = match crate::workspace_json::load_dependency_manifest(root) {
+        Some(manifest) => manifest.compiled_jars,
+        None => crate::indexer::jar::scan_gradle_jars(None),
+    };
+    let mut paths = compiled_jar_paths_for_cli(root, dependencies);
+    for path in crate::workspace_json::load_configured_jar_paths(root) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 async fn run_find(root: &Path, mode: Mode, json: bool, verbose: bool, name: &str) {
     let results = match effective_mode(mode, root, "find", verbose) {
         Mode::Fast => fast_find(name, root),
@@ -512,8 +543,7 @@ async fn run_find(root: &Path, mode: Mode, json: bool, verbose: bool, name: &str
             let index = build_index(root, false).await;
             // Scan Gradle JARs (+ the Android SDK jar, if detected) so
             // stdlib/library/Android symbols resolve in find queries.
-            let jars =
-                compiled_jar_paths_for_cli(root, crate::indexer::jar::scan_gradle_jars(None));
+            let jars = dependency_jar_paths_for_cli(root);
             if !jars.is_empty() {
                 if let Ok(mut sidecar_guard) = index.jar_sidecar.lock() {
                     crate::indexer::jar::clear_jar_maps(&index);
@@ -784,7 +814,7 @@ async fn run_diagnose(root: &Path, file: &Path, _verbose: bool, only: Option<&[S
         // `Unavailable`, which is terminal — which is why the gap only showed up
         // once a sidecar became present, e.g. in CI after the sidecar artifact
         // was wired into the test jobs.)
-        let jars = compiled_jar_paths_for_cli(root, crate::indexer::jar::scan_gradle_jars(None));
+        let jars = dependency_jar_paths_for_cli(root);
         if let Ok(mut sidecar_guard) = index.jar_sidecar.lock() {
             let total = if jars.is_empty() {
                 0

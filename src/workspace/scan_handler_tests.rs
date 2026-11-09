@@ -8,6 +8,42 @@ use crate::workspace::Config;
 
 use super::ScanHandler;
 
+#[test]
+fn dependency_manifest_replaces_cache_crawl_including_empty_and_invalid() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let older = root.join("library-1.jar");
+    std::fs::write(&older, "").unwrap();
+    std::fs::write(
+        root.join("workspace.json"),
+        r#"{"dependencyManifest":"deps.json"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("deps.json"),
+        r#"{"compiledJars":["library-1.jar"],"sourceJars":[]}"#,
+    )
+    .unwrap();
+    let manifest = crate::workspace_json::load_dependency_manifest(root);
+    let paths = super::dependency_compiled_paths(manifest, || {
+        panic!("must not crawl unrelated/newer cached dependencies")
+    });
+    assert_eq!(paths, vec![older]);
+    for content in [r#"{"compiledJars":[],"sourceJars":[]}"#, "malformed"] {
+        std::fs::write(root.join("deps.json"), content).unwrap();
+        let manifest = crate::workspace_json::load_dependency_manifest(root);
+        assert!(super::dependency_compiled_paths(manifest, || panic!("no fallback")).is_empty());
+    }
+    std::fs::remove_file(root.join("deps.json")).unwrap();
+    let manifest = crate::workspace_json::load_dependency_manifest(root);
+    assert!(super::dependency_compiled_paths(manifest, || panic!("no fallback")).is_empty());
+    let cached = vec![root.join("unrelated.jar"), root.join("library-2.jar")];
+    assert_eq!(
+        super::dependency_compiled_paths(None, || cached.clone()),
+        cached
+    );
+}
+
 fn make_handler(indexer: Arc<Indexer>) -> ScanHandler<NoopReporter> {
     let (scan_done_tx, _scan_done_rx) = mpsc::unbounded_channel();
     let (jar_done_tx, _jar_done_rx) = mpsc::unbounded_channel();
@@ -18,6 +54,42 @@ fn make_handler(indexer: Arc<Indexer>) -> ScanHandler<NoopReporter> {
         scan_done_tx,
         jar_done_tx,
     )
+}
+
+#[tokio::test]
+async fn changed_source_scope_prunes_retained_extracted_libraries() {
+    let root = tempfile::tempdir().unwrap();
+    let old_sources = tempfile::tempdir().unwrap();
+    let active_sources = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("workspace.json"), r#"{"sourcePaths":[]}"#).unwrap();
+    let indexer = Arc::new(Indexer::new());
+    let handler = make_handler(Arc::clone(&indexer));
+    let old_uri =
+        tower_lsp::lsp_types::Url::from_file_path(old_sources.path().join("Old.kt")).unwrap();
+    let active_uri =
+        tower_lsp::lsp_types::Url::from_file_path(active_sources.path().join("Active.kt")).unwrap();
+    for (uri, content) in [(&old_uri, "class Old"), (&active_uri, "class Active")] {
+        indexer.index_content(uri, content);
+        indexer.library_uris.insert(uri.to_string());
+    }
+    handler
+        .apply_config(Config {
+            root: root.path().to_path_buf(),
+            explicit_source_paths: vec![active_sources.path().to_string_lossy().into_owned()],
+            ignore_patterns: Vec::new(),
+            jar_paths: Vec::new(),
+            pin_workspace: true,
+        })
+        .await;
+    indexer.prune_source_path_libraries(root.path());
+    indexer.reset_index_state();
+    assert!(!indexer.files.contains_key(old_uri.as_str()));
+    assert!(indexer.definition_locations("Old").is_empty());
+    assert!(indexer.files.contains_key(active_uri.as_str()));
+    assert!(!indexer.definition_locations("Active").is_empty());
+    indexer.source_paths_raw.write().unwrap().clear();
+    indexer.prune_source_path_libraries(root.path());
+    assert!(indexer.definition_locations("Active").is_empty());
 }
 
 #[tokio::test]
